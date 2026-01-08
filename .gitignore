@@ -222,3 +222,4 @@ music_ratings/postgres_data*
 spotify-tools/unmatched_spotify_songs.txt
 
 config.py
+notes.txt
