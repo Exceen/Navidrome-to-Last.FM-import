@@ -1,4 +1,5 @@
 import requests
+from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError
 import time
 import random
 import argparse
@@ -37,6 +38,55 @@ if TEST_MODE:
 # Helpers
 # ----------------------------
 
+def retry_with_backoff(func, max_retries=3, initial_delay=1, backoff_factor=2, *args, **kwargs):
+    """
+    Retry a function with exponential backoff.
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except (RequestException, ConnectionError, Timeout, WSError) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                print(f"  ⚠️  Network error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
+                print(f"  ⏳ Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= backoff_factor
+            else:
+                print(f"  ❌ Failed after {max_retries} attempts: {str(e)[:100]}")
+        except HTTPError as e:
+            # Check if it's a rate limit error (429) or server error (5xx)
+            if hasattr(e, 'response') and e.response is not None:
+                status_code = e.response.status_code
+                if status_code == 429:
+                    # Rate limit - wait longer
+                    retry_after = int(e.response.headers.get('Retry-After', delay * 2))
+                    print(f"  ⚠️  Rate limited (429). Waiting {retry_after}s...")
+                    time.sleep(retry_after)
+                    if attempt < max_retries - 1:
+                        continue
+                elif 500 <= status_code < 600:
+                    # Server error - retry
+                    if attempt < max_retries - 1:
+                        print(f"  ⚠️  Server error {status_code} (attempt {attempt + 1}/{max_retries})")
+                        print(f"  ⏳ Retrying in {delay}s...")
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                        continue
+            last_exception = e
+            print(f"  ❌ HTTP error: {str(e)[:100]}")
+            break
+        except Exception as e:
+            # Unexpected error - don't retry
+            last_exception = e
+            print(f"  ❌ Unexpected error: {str(e)[:100]}")
+            break
+
+    raise last_exception if last_exception else Exception("Retry failed with no exception")
+
 def normalize(s):
     return s.lower().strip()
 
@@ -44,51 +94,59 @@ def fuzzy_match(a, b):
     return fuzz.token_sort_ratio(normalize(a), normalize(b))
 
 def find_track(artist, title):
+    def _find():
+        try:
+            track = network.get_track(artist, title)
+            track.get_userplaycount()  # verify it exists
+            return track
+        except WSError as wse:
+            # print('track not found by exact match:', artist, '|', title)
+
+            results = network.search_for_track(
+                artist_name=artist,
+                track_name=title,
+            ).get_next_page()
+
+            for track in results[:10]:
+
+                # fuzzy_match(artist, artist) < config.FUZZY_THRESHOLD
+                artist_val = fuzzy_match(artist, str(track.artist))
+                title_val = fuzzy_match(title, str(track.title))
+
+                # print(int(artist_val), int(title_val), track.artist, "-", track.title)
+
+                if artist_val >= config.FUZZY_THRESHOLD and title_val >= config.FUZZY_THRESHOLD:
+                    try:
+                        track.get_userplaycount()  # verify it exists
+                        print('  -> matched!', '|', track.artist, '|', track.title, '|')
+                        return track
+                    except WSError:
+                        continue
+
+        return None
+
     try:
-        track = network.get_track(artist, title)
-        track.get_userplaycount() # verify it exists
-        return track
-    except WSError as wse:
-        # print('track not found by exact match:', artist, '|', title)
-
-        results = network.search_for_track(
-            artist_name=artist,
-            track_name=title,
-        ).get_next_page()
-
-        for track in results[:10]:
-
-            # fuzzy_match(artist, artist) < config.FUZZY_THRESHOLD
-            artist_val = fuzzy_match(artist, str(track.artist))
-            title_val = fuzzy_match(title, str(track.title))
-
-            # print(int(artist_val), int(title_val), track.artist, "-", track.title)
-
-            if artist_val >= config.FUZZY_THRESHOLD and title_val >= config.FUZZY_THRESHOLD:
-                try:
-                    track.get_userplaycount() # verify it exists
-                    print('  -> matched!', '|', track.artist, '|', track.title, '|')
-                    return track
-                except WSError:
-                    continue
-
+        return retry_with_backoff(_find, max_retries=3)
     except Exception as e:
-        print('Exception finding track:', e)
-
-    return None
+        print(f'  ❌ Failed to find track after retries: {artist} - {title}')
+        return None
 
 
 LASTFM_PLAYCOUNTS = {}
 def get_lastfm_playcount(artist, title):
     if not((artist, title) in LASTFM_PLAYCOUNTS):
-        track = find_track(artist, title)
-        if track is None:
+        try:
+            track = find_track(artist, title)
+            if track is None:
+                LASTFM_PLAYCOUNTS[(artist, title)] = {}
+            else:
+                LASTFM_PLAYCOUNTS[(artist, title)] = {
+                    'playcount': track.get_userplaycount() or 0,
+                    'scrobbled_this_run_count': 0,
+                }
+        except Exception as e:
+            print(f"  ⚠️  Error getting Last.fm playcount for {artist} - {title}: {str(e)[:100]}")
             LASTFM_PLAYCOUNTS[(artist, title)] = {}
-        else:
-            LASTFM_PLAYCOUNTS[(artist, title)] = {
-                'playcount': track.get_userplaycount() or 0,
-                'scrobbled_this_run_count': 0,
-            }
 
     pc_data = LASTFM_PLAYCOUNTS[(artist, title)]
     if pc_data is None or 'playcount' not in pc_data:
@@ -107,12 +165,20 @@ def scrobble_once(artist, title, dry_run):
     if dry_run:
         print(f"  [DRY] scrobble @ {dt}: {artist} – {title} ")
     else:
-        network.scrobble(
-            artist=artist,
-            title=title,
-            timestamp=timestamp,
-        )
-        time.sleep(config.SCROBBLE_DELAY)
+        def _scrobble():
+            network.scrobble(
+                artist=artist,
+                title=title,
+                timestamp=timestamp,
+            )
+            time.sleep(config.SCROBBLE_DELAY)
+
+        try:
+            retry_with_backoff(_scrobble, max_retries=5, initial_delay=2)
+            print(f"  ✓ Scrobbled @ {dt}: {artist} – {title}")
+        except Exception as e:
+            print(f"  ❌ Failed to scrobble after retries: {artist} – {title}")
+            raise  # Re-raise to let the caller handle it
 
     LASTFM_PLAYCOUNTS[(artist, title)]['scrobbled_this_run_count'] += 1
 
@@ -127,13 +193,31 @@ def api_call(endpoint, params):
         "c": "ND2LastFM",
         "f": "json",
     }
-    r = requests.get(
-        f"{config.NAVIDROME_API_URL}/{endpoint}",
-        params={**base, **params},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["subsonic-response"]
+
+    def _make_request():
+        try:
+            r = requests.get(
+                f"{config.NAVIDROME_API_URL}/{endpoint}",
+                params={**base, **params},
+                timeout=30,
+            )
+            r.raise_for_status()
+
+            json_response = r.json()
+            if "subsonic-response" not in json_response:
+                raise ValueError("Invalid API response: missing 'subsonic-response'")
+
+            # Check for API-level errors
+            response_data = json_response["subsonic-response"]
+            if response_data.get("status") == "failed":
+                error = response_data.get("error", {})
+                raise Exception(f"Navidrome API error: {error.get('message', 'Unknown error')}")
+
+            return response_data
+        except requests.exceptions.JSONDecodeError as e:
+            raise Exception(f"Invalid JSON response from Navidrome: {str(e)}")
+
+    return retry_with_backoff(_make_request, max_retries=3)
 
 def fetch_all_tracks():
     """
@@ -146,37 +230,53 @@ def fetch_all_tracks():
     size = NAVIDROME_PAGE_COUNT
 
     while True:
-        resp = api_call(
-            "getAlbumList2.view",
-            {"type": "alphabeticalByName", "offset": offset, "size": size},
-        )
+        try:
+            resp = api_call(
+                "getAlbumList2.view",
+                {"type": "alphabeticalByName", "offset": offset, "size": size},
+            )
 
-        albums = resp.get("albumList2", {}).get("album", [])
-        if not albums:
-            break
+            albums = resp.get("albumList2", {}).get("album", [])
+            if not albums:
+                break
 
-        for album in albums:
-            album_id = album["id"]
-            album_resp = api_call("getAlbum.view", {"id": album_id})
-            songs = album_resp.get("album", {}).get("song", [])
+            for album in albums:
+                album_id = album["id"]
+                try:
+                    album_resp = api_call("getAlbum.view", {"id": album_id})
+                    songs = album_resp.get("album", {}).get("song", [])
 
-            for s in songs:
-                playcount = s.get("playCount", 0)
-                if playcount > 0:
-                    tracks.append(
-                        {
-                            "artist": s.get("artist"),
-                            "title": s.get("title"),
-                            "playcount": playcount,
-                        }
-                    )
+                    for s in songs:
+                        playcount = s.get("playCount", 0)
+                        if playcount > 0:
+                            tracks.append(
+                                {
+                                    "artist": s.get("artist"),
+                                    "title": s.get("title"),
+                                    "playcount": playcount,
+                                }
+                            )
+                except Exception as e:
+                    print(f"  ⚠️  Failed to fetch album {album_id}: {str(e)[:100]}")
+                    print(f"  → Continuing with next album...")
+                    continue
 
-        offset += len(albums)
-        if len(albums) < size:
-            break
+            offset += len(albums)
+            if len(albums) < size:
+                break
 
-        if BREAK_AT_FIRST_PAGE:
-            break
+            if BREAK_AT_FIRST_PAGE:
+                break
+
+        except Exception as e:
+            print(f"  ❌ Failed to fetch album list at offset {offset}: {str(e)[:100]}")
+            print(f"  → Will retry or skip if retries exhausted...")
+            # If we already have some tracks, we can continue
+            if len(tracks) > 0:
+                print(f"  → Proceeding with {len(tracks)} tracks already fetched")
+                break
+            else:
+                raise  # Re-raise if we have no tracks at all
 
     return tracks
 
@@ -188,9 +288,14 @@ def main(dry_run, max_scrobbles):
         print("⚠️  LIVE MODE: scrobbles will be sent to Last.fm\n")
     else:
         print("🧪 DRY-RUN MODE: no scrobbles will be sent\n")
-    
-    tracks = fetch_all_tracks()
-    print(f"Fetched {len(tracks)} tracks with playcounts")
+
+    try:
+        tracks = fetch_all_tracks()
+        print(f"Fetched {len(tracks)} tracks with playcounts")
+    except Exception as e:
+        print(f"\n❌ Fatal error: Failed to fetch tracks from Navidrome: {str(e)}")
+        print("Please check your network connection and Navidrome configuration.")
+        return
 
     total_scrobbled = 0
 
@@ -236,8 +341,13 @@ def main(dry_run, max_scrobbles):
             delta = nd_count - lf_count
             print(f"[MATCH] {artist} – {title} | Navidrome={nd_count} Last.fm={lf_count} → +{delta}")
 
-            scrobble_once(artist, title, dry_run)
-            total_scrobbled += 1
+            try:
+                scrobble_once(artist, title, dry_run)
+                total_scrobbled += 1
+            except Exception as e:
+                print(f"  ⚠️  Scrobble failed, will retry this track later")
+                # Don't remove the track from the list, so it can be retried later
+                # But continue with next track to avoid getting stuck
 
 
 
