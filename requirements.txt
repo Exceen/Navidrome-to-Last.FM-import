@@ -1,0 +1,3 @@
+pylast==5.5.0
+RapidFuzz==3.13.0
+requests==2.32.5
