@@ -1,5 +1,6 @@
 import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import random
 import argparse
@@ -12,7 +13,7 @@ from rapidfuzz import fuzz
 # ----------------------------
 # General settings
 # ----------------------------
-TEST_MODE = False
+TEST_MODE = True
 
 # ----------------------------
 # Last.fm setup
@@ -30,9 +31,14 @@ network = pylast.LastFMNetwork(
 
 NAVIDROME_PAGE_COUNT = 500
 BREAK_AT_FIRST_PAGE = False
+MAX_WORKERS = 5  # Number of parallel API calls for fetching albums
 if TEST_MODE:
     NAVIDROME_PAGE_COUNT = 10
     BREAK_AT_FIRST_PAGE = True
+    MAX_WORKERS = 3
+
+# Persistent HTTP session for connection pooling
+navidrome_session = requests.Session()
 
 # ----------------------------
 # Helpers
@@ -90,8 +96,16 @@ def retry_with_backoff(func, max_retries=3, initial_delay=1, backoff_factor=2, *
 def normalize(s):
     return s.lower().strip()
 
+# Cache for normalized strings to avoid redundant normalization
+_normalize_cache = {}
+
+def normalize_cached(s):
+    if s not in _normalize_cache:
+        _normalize_cache[s] = s.lower().strip()
+    return _normalize_cache[s]
+
 def fuzzy_match(a, b):
-    return fuzz.token_sort_ratio(normalize(a), normalize(b))
+    return fuzz.token_sort_ratio(normalize_cached(a), normalize_cached(b))
 
 def find_track(artist, title):
     def _find():
@@ -196,7 +210,7 @@ def api_call(endpoint, params):
 
     def _make_request():
         try:
-            r = requests.get(
+            r = navidrome_session.get(
                 f"{config.NAVIDROME_API_URL}/{endpoint}",
                 params={**base, **params},
                 timeout=30,
@@ -219,13 +233,37 @@ def api_call(endpoint, params):
 
     return retry_with_backoff(_make_request, max_retries=3)
 
+def fetch_album_songs(album_id):
+    """
+    Fetch songs for a single album.
+    Returns list of track dicts with playcount > 0.
+    """
+    try:
+        album_resp = api_call("getAlbum.view", {"id": album_id})
+        songs = album_resp.get("album", {}).get("song", [])
+
+        tracks = []
+        for s in songs:
+            playcount = s.get("playCount", 0)
+            if playcount > 0:
+                tracks.append(
+                    {
+                        "artist": s.get("artist"),
+                        "title": s.get("title"),
+                        "playcount": playcount,
+                    }
+                )
+        return tracks
+    except Exception as e:
+        print(f"  ⚠️  Failed to fetch album {album_id}: {str(e)[:100]}")
+        return []
+
 def fetch_all_tracks():
     """
-    Fetches all albums, then all songs per album.
+    Fetches all albums, then all songs per album (in parallel).
     Returns [{artist, title, playcount}]
     """
     tracks = []
-
     offset = 0
     size = NAVIDROME_PAGE_COUNT
 
@@ -240,26 +278,21 @@ def fetch_all_tracks():
             if not albums:
                 break
 
-            for album in albums:
-                album_id = album["id"]
-                try:
-                    album_resp = api_call("getAlbum.view", {"id": album_id})
-                    songs = album_resp.get("album", {}).get("song", [])
+            # Fetch songs for all albums in parallel
+            print(f"  Fetching songs for {len(albums)} albums in parallel...")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Submit all album fetches
+                future_to_album = {
+                    executor.submit(fetch_album_songs, album["id"]): album["id"]
+                    for album in albums
+                }
 
-                    for s in songs:
-                        playcount = s.get("playCount", 0)
-                        if playcount > 0:
-                            tracks.append(
-                                {
-                                    "artist": s.get("artist"),
-                                    "title": s.get("title"),
-                                    "playcount": playcount,
-                                }
-                            )
-                except Exception as e:
-                    print(f"  ⚠️  Failed to fetch album {album_id}: {str(e)[:100]}")
-                    print(f"  → Continuing with next album...")
-                    continue
+                # Collect results as they complete
+                for future in as_completed(future_to_album):
+                    album_tracks = future.result()
+                    tracks.extend(album_tracks)
+
+            print(f"  → Fetched {len(tracks)} total tracks so far")
 
             offset += len(albums)
             if len(albums) < size:
@@ -284,23 +317,39 @@ def fetch_all_tracks():
 # Main logic
 # ----------------------------
 def main(dry_run, max_scrobbles):
+    start_time = time.time()
+
     if not dry_run:
         print("⚠️  LIVE MODE: scrobbles will be sent to Last.fm\n")
     else:
         print("🧪 DRY-RUN MODE: no scrobbles will be sent\n")
 
     try:
+        fetch_start = time.time()
         tracks = fetch_all_tracks()
-        print(f"Fetched {len(tracks)} tracks with playcounts")
+        fetch_duration = time.time() - fetch_start
+        print(f"Fetched {len(tracks)} tracks with playcounts in {fetch_duration:.2f}s")
     except Exception as e:
         print(f"\n❌ Fatal error: Failed to fetch tracks from Navidrome: {str(e)}")
         print("Please check your network connection and Navidrome configuration.")
         return
 
     total_scrobbled = 0
+    # initial_track_count = len(tracks)
 
     while True:
-        print('='*40)
+        if max_scrobbles is not None:
+            s = f'{total_scrobbled} / {max_scrobbles} scrobbles'
+            c = int((40 - len(s)) / 2) - 1
+            o = '='*c + ' ' + s + ' '
+            print(o.ljust(40, '='))
+        else:
+            print('='*40)
+
+        # processed = initial_track_count - len(tracks)
+        # progress_pct = (processed / initial_track_count * 100) if initial_track_count > 0 else 0
+        # print(f"Progress: {processed}/{initial_track_count} tracks processed ({progress_pct:.1f}%)")
+
         if len(tracks) == 0:
             print("\n✅ Done. No more tracks to process.")
             break
@@ -351,7 +400,11 @@ def main(dry_run, max_scrobbles):
 
 
 
+    total_duration = time.time() - start_time
     print(f"\n✅ Done. Total scrobbles {'planned' if dry_run else 'sent'}: {total_scrobbled}")
+    print(f"Total execution time: {total_duration:.2f}s ({total_duration / 60:.2f} min)")
+    if total_scrobbled > 0:
+        print(f"Average time per scrobble: {total_duration / total_scrobbled:.2f}s")
 
 # ----------------------------
 # CLI
