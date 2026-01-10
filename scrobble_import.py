@@ -13,7 +13,7 @@ from rapidfuzz import fuzz
 # ----------------------------
 # General settings
 # ----------------------------
-TEST_MODE = True
+TEST_MODE = False
 
 # ----------------------------
 # Last.fm setup
