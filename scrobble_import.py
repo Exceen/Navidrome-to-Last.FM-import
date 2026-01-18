@@ -358,8 +358,11 @@ def main(dry_run, max_scrobbles):
             print(f"\n🛑 Reached scrobble limit ({max_scrobbles}). Stopping.")
             break
 
-        # get random song
-        idx = random.randint(0, len(tracks) - 1)
+        # Select track with weighted random based on playcount (higher playcount = higher priority)
+        playcounts = [t["playcount"] for t in tracks]
+        total_playcount = sum(playcounts)
+        weights = [playcount / total_playcount for playcount in playcounts]
+        idx = random.choices(range(len(tracks)), weights=weights, k=1)[0]
         t = tracks[idx]
 
         artist = t["artist"]
