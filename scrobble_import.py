@@ -109,16 +109,18 @@ def normalize_cached(s):
 def fuzzy_match(a, b):
     return fuzz.token_sort_ratio(normalize_cached(a), normalize_cached(b))
 
-def find_track(artist, title):
+def find_track(artist, title, net=None):
+    if net is None:
+        net = network
     def _find():
         try:
-            track = network.get_track(artist, title)
+            track = net.get_track(artist, title)
             track.get_userplaycount()  # verify it exists
             return track
         except WSError as wse:
             # print('track not found by exact match:', artist, '|', title)
 
-            results = network.search_for_track(
+            results = net.search_for_track(
                 artist_name=artist,
                 track_name=title,
             ).get_next_page()
@@ -488,25 +490,35 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
 
 
 DELETE_WORKERS = 10
-_lastfm_api_lock = threading.Lock()
+_thread_local = threading.local()
+
+def get_thread_network():
+    """Get a per-thread pylast.LastFMNetwork instance."""
+    if not hasattr(_thread_local, "network"):
+        _thread_local.network = pylast.LastFMNetwork(
+            api_key=config.LASTFM_API_KEY,
+            api_secret=config.LASTFM_API_SECRET,
+            username=config.LASTFM_USERNAME,
+            password_hash=password,
+        )
+    return _thread_local.network
 
 def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, counter, total, lock):
     with lock:
         counter[0] += 1
         idx = counter[0]
     prefix = f"[{idx}/{total}] {artist} – {title}"
+    net = get_thread_network()
 
     try:
-        with _lastfm_api_lock:
-            track = find_track(artist, title)
+        track = find_track(artist, title, net)
         if track is None:
             print(f"{prefix} | Not found on Last.fm, skipping")
             return 0
 
-        with _lastfm_api_lock:
-            lf_artist = str(track.artist)
-            lf_title = str(track.title)
-            lf_count = track.get_userplaycount() or 0
+        lf_artist = str(track.artist)
+        lf_title = str(track.title)
+        lf_count = track.get_userplaycount() or 0
 
         if lf_count <= nd_count:
             print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → OK")
@@ -515,9 +527,8 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
         excess = lf_count - nd_count
         print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → {excess} excess")
 
-        with _lastfm_api_lock:
-            user = network.get_user(config.LASTFM_USERNAME)
-            scrobbles = user.get_track_scrobbles(artist=lf_artist, track=lf_title)
+        user = net.get_user(config.LASTFM_USERNAME)
+        scrobbles = user.get_track_scrobbles(artist=lf_artist, track=lf_title)
         timestamps = [int(s.timestamp) for s in scrobbles[:excess]]
 
         if len(timestamps) < excess:
