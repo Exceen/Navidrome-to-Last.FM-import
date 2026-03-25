@@ -1,9 +1,11 @@
 import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import time
 import random
 import argparse
+import getpass
 import pylast
 from pylast import WSError
 
@@ -410,6 +412,173 @@ def main(dry_run, max_scrobbles):
         print(f"Average time per scrobble: {total_duration / total_scrobbled:.2f}s")
 
 # ----------------------------
+# Delete excess scrobbles mode
+# ----------------------------
+def get_lastfm_web_session(password):
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    session.get("https://www.last.fm/login")
+    csrf_token = session.cookies.get("csrftoken")
+    if not csrf_token:
+        raise Exception("Failed to get CSRF token from Last.fm login page")
+
+    resp = session.post("https://www.last.fm/login", data={
+        "csrfmiddlewaretoken": csrf_token,
+        "username_or_email": config.LASTFM_USERNAME,
+        "password": password,
+    }, headers={
+        "Referer": "https://www.last.fm/login",
+    }, allow_redirects=True)
+
+    if "sessionid" not in session.cookies.get_dict(".last.fm"):
+        raise Exception("Last.fm web login failed - no session cookie received")
+
+    return session
+
+
+_web_session_lock = threading.Lock()
+
+def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
+    dt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+
+    if dry_run:
+        print(f"  [DRY] would delete @ {dt}: {artist} - {title}")
+        return True
+
+    with _web_session_lock:
+        csrf_token = web_session.cookies.get("csrftoken")
+        resp = web_session.post(
+            f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library/delete",
+            data={
+                "csrfmiddlewaretoken": csrf_token,
+                "artist_name": artist,
+                "track_name": title,
+                "timestamp": str(timestamp),
+            },
+            headers={
+                "Referer": f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+
+    if resp.status_code == 200:
+        print(f"  Deleted @ {dt}: {artist} - {title}")
+        return True
+    else:
+        print(f"  Failed to delete @ {dt}: {artist} - {title} (status {resp.status_code})")
+        return False
+
+
+DELETE_WORKERS = 10
+_lastfm_api_lock = threading.Lock()
+
+def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, counter, total, lock):
+    with lock:
+        counter[0] += 1
+        idx = counter[0]
+    prefix = f"[{idx}/{total}] {artist} – {title}"
+
+    try:
+        with _lastfm_api_lock:
+            track = find_track(artist, title)
+        if track is None:
+            print(f"{prefix} | Not found on Last.fm, skipping")
+            return 0
+
+        with _lastfm_api_lock:
+            lf_artist = str(track.artist)
+            lf_title = str(track.title)
+            lf_count = track.get_userplaycount() or 0
+
+        if lf_count <= nd_count:
+            print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → OK")
+            return 0
+
+        excess = lf_count - nd_count
+        print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → {excess} excess")
+
+        with _lastfm_api_lock:
+            user = network.get_user(config.LASTFM_USERNAME)
+            scrobbles = user.get_track_scrobbles(artist=lf_artist, track=lf_title)
+        timestamps = [int(s.timestamp) for s in scrobbles[:excess]]
+
+        if len(timestamps) < excess:
+            print(f"{prefix} | ⚠️  Only found {len(timestamps)} timestamps, expected {excess}")
+
+        deleted = 0
+        for ts in timestamps:
+            if delete_scrobble(web_session, lf_artist, lf_title, ts, dry_run):
+                deleted += 1
+            time.sleep(config.SCROBBLE_DELAY)
+
+        return deleted
+
+    except Exception as e:
+        print(f"{prefix} | ❌ Error: {str(e)[:100]}")
+        return 0
+
+
+def main_delete(dry_run):
+    start_time = time.time()
+
+    if not dry_run:
+        print("⚠️  DELETE MODE (LIVE): excess scrobbles will be deleted from Last.fm\n")
+    else:
+        print("🧪 DELETE MODE (DRY-RUN): no scrobbles will be deleted\n")
+
+    password = getpass.getpass("Enter your Last.fm password: ")
+    try:
+        web_session = get_lastfm_web_session(password)
+        print("Logged into Last.fm website\n")
+    except Exception as e:
+        print(f"\n❌ {e}")
+        return
+
+    try:
+        fetch_start = time.time()
+        nd_tracks = fetch_all_tracks()
+        fetch_duration = time.time() - fetch_start
+        print(f"Fetched {len(nd_tracks)} tracks from Navidrome in {fetch_duration:.2f}s\n")
+    except Exception as e:
+        print(f"\n❌ Fatal error: Failed to fetch tracks from Navidrome: {str(e)}")
+        return
+
+    # Build Navidrome playcount lookup (aggregate duplicates)
+    nd_playcounts = {}
+    for t in nd_tracks:
+        key = (t["artist"], t["title"])
+        nd_playcounts[key] = nd_playcounts.get(key, 0) + t["playcount"]
+
+    total = len(nd_playcounts)
+    counter = [0]  # mutable counter for threads
+    lock = threading.Lock()
+    total_deleted = 0
+
+    print(f"Checking {total} tracks with {DELETE_WORKERS} parallel workers...\n")
+
+    with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                process_track_for_deletion,
+                artist, title, nd_count, web_session, dry_run, counter, total, lock
+            ): (artist, title)
+            for (artist, title), nd_count in nd_playcounts.items()
+        }
+
+        for future in as_completed(futures):
+            try:
+                total_deleted += future.result()
+            except Exception as e:
+                artist, title = futures[future]
+                print(f"❌ Unhandled error for {artist} – {title}: {str(e)[:100]}")
+
+    total_duration = time.time() - start_time
+    print(f"\n✅ Done. Checked {total} tracks, deleted {total_deleted} excess scrobbles.")
+    print(f"Total execution time: {total_duration:.2f}s ({total_duration / 60:.2f} min)")
+
+
+# ----------------------------
 # CLI
 # ----------------------------
 if __name__ == "__main__":
@@ -427,9 +596,17 @@ if __name__ == "__main__":
         default=None,
         help="Stop after N scrobbles",
     )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete excess scrobbles from Last.fm when Last.fm count > Navidrome count",
+    )
 
     args = parser.parse_args()
-    main(dry_run=args.dry_run, max_scrobbles=args.max)
+    if args.delete:
+        main_delete(dry_run=args.dry_run)
+    else:
+        main(dry_run=args.dry_run, max_scrobbles=args.max)
 
 
     # t = network.get_track('Metallica', 'The Small Hours')
