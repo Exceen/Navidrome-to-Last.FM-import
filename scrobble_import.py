@@ -489,7 +489,7 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
         return False
 
 
-DELETE_WORKERS = 10
+DELETE_WORKERS = 2
 _thread_local = threading.local()
 
 def get_thread_network():
