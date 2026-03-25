@@ -313,6 +313,23 @@ def fetch_all_tracks():
             else:
                 raise  # Re-raise if we have no tracks at all
 
+    # Merge tracks with same artist+title (Last.fm doesn't distinguish by album)
+    # Use lowercase key for matching, but preserve original casing from the entry with highest playcount
+    merged = {}
+    for t in tracks:
+        key = (t["artist"].lower().strip(), t["title"].lower().strip())
+        if key not in merged:
+            merged[key] = {"artist": t["artist"], "title": t["title"], "playcount": t["playcount"]}
+        else:
+            merged[key]["playcount"] += t["playcount"]
+            # Keep the casing from the entry with the most plays
+            if t["playcount"] > merged[key]["playcount"] - t["playcount"]:
+                merged[key]["artist"] = t["artist"]
+                merged[key]["title"] = t["title"]
+
+    tracks = list(merged.values())
+    print(f"  → {len(tracks)} unique tracks after merging duplicates")
+
     return tracks
 
 # ----------------------------
@@ -544,13 +561,7 @@ def main_delete(dry_run):
         print(f"\n❌ Fatal error: Failed to fetch tracks from Navidrome: {str(e)}")
         return
 
-    # Build Navidrome playcount lookup (aggregate duplicates)
-    nd_playcounts = {}
-    for t in nd_tracks:
-        key = (t["artist"], t["title"])
-        nd_playcounts[key] = nd_playcounts.get(key, 0) + t["playcount"]
-
-    total = len(nd_playcounts)
+    total = len(nd_tracks)
     counter = [0]  # mutable counter for threads
     lock = threading.Lock()
     total_deleted = 0
@@ -561,9 +572,9 @@ def main_delete(dry_run):
         futures = {
             executor.submit(
                 process_track_for_deletion,
-                artist, title, nd_count, web_session, dry_run, counter, total, lock
-            ): (artist, title)
-            for (artist, title), nd_count in nd_playcounts.items()
+                t["artist"], t["title"], t["playcount"], web_session, dry_run, counter, total, lock
+            ): (t["artist"], t["title"])
+            for t in nd_tracks
         }
 
         for future in as_completed(futures):
