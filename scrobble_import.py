@@ -16,6 +16,7 @@ from rapidfuzz import fuzz
 # General settings
 # ----------------------------
 TEST_MODE = False
+DELETE_WORKERS = 5
 
 # ----------------------------
 # Last.fm setup
@@ -46,7 +47,7 @@ navidrome_session = requests.Session()
 # Helpers
 # ----------------------------
 
-def retry_with_backoff(func, max_retries=3, initial_delay=1, backoff_factor=2, *args, **kwargs):
+def retry_with_backoff(func, max_retries=6, initial_delay=1, backoff_factor=3, *args, **kwargs):
     """
     Retry a function with exponential backoff.
     """
@@ -489,7 +490,6 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
         return False
 
 
-DELETE_WORKERS = 2
 _thread_local = threading.local()
 
 def get_thread_network():
