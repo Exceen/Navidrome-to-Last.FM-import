@@ -438,21 +438,27 @@ def get_lastfm_web_session(password):
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    session.get("https://www.last.fm/login")
-    csrf_token = session.cookies.get("csrftoken")
-    if not csrf_token:
-        raise Exception("Failed to get CSRF token from Last.fm login page")
+    import re
+    login_page = session.get("https://www.last.fm/login")
+
+    # CSRF token must come from the hidden form field, not the cookie
+    form_csrf = re.findall(r"name=[\"']csrfmiddlewaretoken[\"'][^>]*value=[\"']([^\"']+)", login_page.text)
+    if not form_csrf:
+        raise Exception("Failed to get CSRF token from Last.fm login form")
+    csrf_token = form_csrf[0]
 
     resp = session.post("https://www.last.fm/login", data={
         "csrfmiddlewaretoken": csrf_token,
         "username_or_email": config.LASTFM_USERNAME,
         "password": password,
+        "next": "/user/_",
     }, headers={
         "Referer": "https://www.last.fm/login",
-    }, allow_redirects=True)
+        "Origin": "https://www.last.fm",
+    }, allow_redirects=False)
 
-    if "sessionid" not in session.cookies.get_dict(".last.fm"):
-        raise Exception("Last.fm web login failed - no session cookie received")
+    if resp.status_code != 302:
+        raise Exception("Last.fm web login failed - incorrect password")
 
     return session
 
@@ -466,8 +472,12 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
         print(f"  [DRY] would delete @ {dt}: {artist} - {title}")
         return True
 
+    import re as _re
     with _web_session_lock:
-        csrf_token = web_session.cookies.get("csrftoken")
+        # Refresh CSRF token from the library page's form field
+        lib_page = web_session.get(f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library")
+        form_csrf = _re.findall(r"name=[\"']csrfmiddlewaretoken[\"'][^>]*value=[\"']([^\"']+)", lib_page.text)
+        csrf_token = form_csrf[0] if form_csrf else web_session.cookies.get("csrftoken")
         resp = web_session.post(
             f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library/delete",
             data={
@@ -478,6 +488,7 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
             },
             headers={
                 "Referer": f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library",
+                "Origin": "https://www.last.fm",
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
@@ -486,7 +497,7 @@ def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
         print(f"  Deleted @ {dt}: {artist} - {title}")
         return True
     else:
-        print(f"  Failed to delete @ {dt}: {artist} - {title} (status {resp.status_code})")
+        print(f"  Failed to delete @ {dt}: {artist} - {title} (status {resp.status_code}: {resp.text[:200]})")
         return False
 
 
