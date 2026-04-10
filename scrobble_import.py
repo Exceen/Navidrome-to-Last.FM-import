@@ -37,7 +37,7 @@ def normalize_for_lastfm(s):
 # General settings
 # ----------------------------
 TEST_MODE = False
-DELETE_WORKERS = 5
+DELETE_WORKERS = 3
 
 # ----------------------------
 # Last.fm setup
