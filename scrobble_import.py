@@ -485,41 +485,62 @@ def get_lastfm_web_session(password):
 
 
 _web_session_lock = threading.Lock()
+_csrf_token = None
+
+def _refresh_csrf_token(web_session):
+    """Fetch a fresh CSRF token from the Last.fm library page."""
+    import re as _re
+    global _csrf_token
+    lib_page = web_session.get(f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library")
+    form_csrf = _re.findall(r"name=[\"']csrfmiddlewaretoken[\"'][^>]*value=[\"']([^\"']+)", lib_page.text)
+    _csrf_token = form_csrf[0] if form_csrf else web_session.cookies.get("csrftoken")
 
 def delete_scrobble(web_session, artist, title, timestamp, dry_run=False):
+    global _csrf_token
     dt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
 
     if dry_run:
         print(f"  [DRY] would delete @ {dt}: {artist} - {title}")
         return True
 
-    import re as _re
     with _web_session_lock:
-        # Refresh CSRF token from the library page's form field
-        lib_page = web_session.get(f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library")
-        form_csrf = _re.findall(r"name=[\"']csrfmiddlewaretoken[\"'][^>]*value=[\"']([^\"']+)", lib_page.text)
-        csrf_token = form_csrf[0] if form_csrf else web_session.cookies.get("csrftoken")
-        resp = web_session.post(
-            f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library/delete",
-            data={
-                "csrfmiddlewaretoken": csrf_token,
-                "artist_name": artist,
-                "track_name": title,
-                "timestamp": str(timestamp),
-            },
-            headers={
-                "Referer": f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library",
-                "Origin": "https://www.last.fm",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        )
+        if _csrf_token is None:
+            _refresh_csrf_token(web_session)
 
-    if resp.status_code == 200:
-        print(f"  Deleted @ {dt}: {artist} - {title}")
-        return True
-    else:
-        print(f"  Failed to delete @ {dt}: {artist} - {title} (status {resp.status_code}: {resp.text[:200]})")
-        return False
+        for attempt in range(3):
+            resp = web_session.post(
+                f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library/delete",
+                data={
+                    "csrfmiddlewaretoken": _csrf_token,
+                    "artist_name": artist,
+                    "track_name": title,
+                    "timestamp": str(timestamp),
+                },
+                headers={
+                    "Referer": f"https://www.last.fm/user/{config.LASTFM_USERNAME}/library",
+                    "Origin": "https://www.last.fm",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+
+            if resp.status_code == 200:
+                print(f"  Deleted @ {dt}: {artist} - {title}")
+                return True
+            elif resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 10 * (attempt + 1)))
+                print(f"  ⚠️  Rate limited, waiting {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+            elif resp.status_code == 403:
+                print(f"  ⚠️  CSRF expired, refreshing token...")
+                _refresh_csrf_token(web_session)
+                continue
+            else:
+                print(f"  Failed to delete @ {dt}: {artist} - {title} (status {resp.status_code}: {resp.text[:200]})")
+                return False
+
+    print(f"  ❌ Failed to delete after retries @ {dt}: {artist} - {title}")
+    return False
 
 
 _thread_local = threading.local()
@@ -570,7 +591,7 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
         for ts in timestamps:
             if delete_scrobble(web_session, lf_artist, lf_title, ts, dry_run):
                 deleted += 1
-            time.sleep(config.SCROBBLE_DELAY)
+            time.sleep(max(config.SCROBBLE_DELAY, 2))
 
         return deleted
 
