@@ -6,11 +6,32 @@ import time
 import random
 import argparse
 import getpass
+import unicodedata
 import pylast
 from pylast import WSError
 
 import config
 from rapidfuzz import fuzz
+
+# Unicode characters that Last.fm's track.getInfo auto-corrects but track.scrobble
+# does not, causing playcount lookups and scrobbles to target different entries.
+_LASTFM_CHAR_MAP = str.maketrans({
+    '\u2010': '-',  # HYPHEN
+    '\u2011': '-',  # NON-BREAKING HYPHEN
+    '\u2012': '-',  # FIGURE DASH
+    '\u2013': '-',  # EN DASH
+    '\u2014': '-',  # EM DASH
+    '\u2015': '-',  # HORIZONTAL BAR
+    '\u2212': '-',  # MINUS SIGN
+    '\u2018': "'",  # LEFT SINGLE QUOTATION MARK
+    '\u2019': "'",  # RIGHT SINGLE QUOTATION MARK
+    '\u201c': '"',  # LEFT DOUBLE QUOTATION MARK
+    '\u201d': '"',  # RIGHT DOUBLE QUOTATION MARK
+})
+
+def normalize_for_lastfm(s):
+    """Normalize Unicode characters that cause mismatches between Last.fm APIs."""
+    return unicodedata.normalize('NFKC', s).translate(_LASTFM_CHAR_MAP)
 
 # ----------------------------
 # General settings
@@ -253,8 +274,8 @@ def fetch_album_songs(album_id):
             if playcount > 0:
                 tracks.append(
                     {
-                        "artist": s.get("artist"),
-                        "title": s.get("title"),
+                        "artist": normalize_for_lastfm(s.get("artist", "")),
+                        "title": normalize_for_lastfm(s.get("title", "")),
                         "playcount": playcount,
                     }
                 )
