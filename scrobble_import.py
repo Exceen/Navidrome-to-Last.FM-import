@@ -599,29 +599,54 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
             print(f"{prefix} | Not found on Last.fm, skipping")
             return 0
 
-        lf_artist = str(track.artist)
-        lf_title = str(track.title)
-        lf_count = track.get_userplaycount() or 0
+        canonical_artist = track._canonical_artist
+        canonical_title = track._canonical_title
+        lf_count = track._userplaycount  # playcount on canonical entry
 
-        if lf_count <= nd_count:
-            print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → OK")
-            return 0
-
-        excess = lf_count - nd_count
-        print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → {excess} excess")
+        # Check if Navidrome name differs from Last.fm canonical name
+        names_differ = (artist != canonical_artist or title != canonical_title)
 
         user = net.get_user(config.LASTFM_USERNAME)
-        scrobbles = user.get_track_scrobbles(artist=lf_artist, track=lf_title)
-        timestamps = [int(s.timestamp) for s in scrobbles[:excess]]
-
-        if len(timestamps) < excess:
-            print(f"{prefix} | ⚠️  Only found {len(timestamps)} timestamps, expected {excess}")
-
         deleted = 0
-        for ts in timestamps:
-            if delete_scrobble(web_session, lf_artist, lf_title, ts, dry_run):
-                deleted += 1
-            time.sleep(max(config.SCROBBLE_DELAY, 2))
+
+        # Step 1: Delete ALL scrobbles under the incorrect/non-canonical name
+        if names_differ:
+            print(f"{prefix} | Incorrect name: '{artist} - {title}' → canonical '{canonical_artist} - {canonical_title}'")
+            try:
+                incorrect_scrobbles = user.get_track_scrobbles(artist=artist, track=title)
+                incorrect_count = len(incorrect_scrobbles)
+            except Exception:
+                incorrect_scrobbles = []
+                incorrect_count = 0
+
+            if incorrect_count > 0:
+                print(f"{prefix} | Deleting {incorrect_count} incorrect scrobbles")
+                for s in incorrect_scrobbles:
+                    if delete_scrobble(web_session, artist, title, int(s.timestamp), dry_run):
+                        deleted += 1
+                    time.sleep(max(config.SCROBBLE_DELAY, 2))
+            else:
+                print(f"{prefix} | No incorrect scrobbles found")
+
+        # Step 2: Delete excess scrobbles on the canonical entry
+        if lf_count > nd_count:
+            excess = lf_count - nd_count
+            print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → {excess} excess on canonical entry")
+            try:
+                canonical_scrobbles = user.get_track_scrobbles(artist=canonical_artist, track=canonical_title)
+                timestamps = [int(s.timestamp) for s in canonical_scrobbles[:excess]]
+            except Exception:
+                timestamps = []
+
+            if len(timestamps) < excess:
+                print(f"{prefix} | ⚠️  Only found {len(timestamps)} timestamps, expected {excess}")
+
+            for ts in timestamps:
+                if delete_scrobble(web_session, canonical_artist, canonical_title, ts, dry_run):
+                    deleted += 1
+                time.sleep(max(config.SCROBBLE_DELAY, 2))
+        elif not names_differ:
+            print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → OK")
 
         return deleted
 
@@ -634,7 +659,7 @@ def main_delete(dry_run):
     start_time = time.time()
 
     if not dry_run:
-        print("⚠️  DELETE MODE (LIVE): excess scrobbles will be deleted from Last.fm\n")
+        print("⚠️  DELETE MODE (LIVE): incorrect and excess scrobbles will be deleted from Last.fm\n")
     else:
         print("🧪 DELETE MODE (DRY-RUN): no scrobbles will be deleted\n")
 
@@ -679,7 +704,7 @@ def main_delete(dry_run):
                 print(f"❌ Unhandled error for {artist} – {title}: {str(e)[:100]}")
 
     total_duration = time.time() - start_time
-    print(f"\n✅ Done. Checked {total} tracks, deleted {total_deleted} excess scrobbles.")
+    print(f"\n✅ Done. Checked {total} tracks, deleted {total_deleted} scrobbles (incorrect + excess).")
     print(f"Total execution time: {total_duration:.2f}s ({total_duration / 60:.2f} min)")
 
 
