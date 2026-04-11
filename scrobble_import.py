@@ -6,32 +6,11 @@ import time
 import random
 import argparse
 import getpass
-import unicodedata
 import pylast
 from pylast import WSError
 
 import config
 from rapidfuzz import fuzz
-
-# Unicode characters that Last.fm's track.getInfo auto-corrects but track.scrobble
-# does not, causing playcount lookups and scrobbles to target different entries.
-_LASTFM_CHAR_MAP = str.maketrans({
-    '\u2010': '-',  # HYPHEN
-    '\u2011': '-',  # NON-BREAKING HYPHEN
-    '\u2012': '-',  # FIGURE DASH
-    '\u2013': '-',  # EN DASH
-    '\u2014': '-',  # EM DASH
-    '\u2015': '-',  # HORIZONTAL BAR
-    '\u2212': '-',  # MINUS SIGN
-    '\u2018': "'",  # LEFT SINGLE QUOTATION MARK
-    '\u2019': "'",  # RIGHT SINGLE QUOTATION MARK
-    '\u201c': '"',  # LEFT DOUBLE QUOTATION MARK
-    '\u201d': '"',  # RIGHT DOUBLE QUOTATION MARK
-})
-
-def normalize_for_lastfm(s):
-    """Normalize Unicode characters that cause mismatches between Last.fm APIs."""
-    return unicodedata.normalize('NFKC', s).translate(_LASTFM_CHAR_MAP)
 
 # ----------------------------
 # General settings
@@ -131,13 +110,53 @@ def normalize_cached(s):
 def fuzzy_match(a, b):
     return fuzz.token_sort_ratio(normalize_cached(a), normalize_cached(b))
 
+def _call_track_getinfo(track):
+    """Call track.getInfo and extract canonical artist, title, and user playcount.
+    Returns (canonical_artist, canonical_title, userplaycount).
+    Raises WSError if the track doesn't exist on Last.fm."""
+    params = track._get_params()
+    params["username"] = track.username
+    doc = track._request("track.getInfo", True, params)
+
+    playcount = 0
+    canonical_artist = str(track.artist)
+    canonical_title = str(track.title)
+
+    try:
+        nodes = doc.getElementsByTagName("userplaycount")
+        if nodes and nodes[0].firstChild:
+            playcount = int(nodes[0].firstChild.data.strip())
+    except (IndexError, ValueError):
+        pass
+
+    try:
+        name_nodes = doc.getElementsByTagName("name")
+        if name_nodes and name_nodes[0].firstChild:
+            canonical_title = name_nodes[0].firstChild.data.strip()
+    except IndexError:
+        pass
+
+    try:
+        artist_nodes = doc.getElementsByTagName("artist")
+        if artist_nodes:
+            artist_name_nodes = artist_nodes[0].getElementsByTagName("name")
+            if artist_name_nodes and artist_name_nodes[0].firstChild:
+                canonical_artist = artist_name_nodes[0].firstChild.data.strip()
+    except IndexError:
+        pass
+
+    return canonical_artist, canonical_title, playcount
+
 def find_track(artist, title, net=None):
     if net is None:
         net = network
     def _find():
         try:
             track = net.get_track(artist, title)
-            track.get_userplaycount()  # verify it exists
+            ca, ct, pc = _call_track_getinfo(track)
+            track._canonical_artist = ca
+            track._canonical_title = ct
+            track._userplaycount = pc
             return track
         except WSError as wse:
             # print('track not found by exact match:', artist, '|', title)
@@ -157,7 +176,10 @@ def find_track(artist, title, net=None):
 
                 if artist_val >= config.FUZZY_THRESHOLD and title_val >= config.FUZZY_THRESHOLD:
                     try:
-                        track.get_userplaycount()  # verify it exists
+                        ca, ct, pc = _call_track_getinfo(track)
+                        track._canonical_artist = ca
+                        track._canonical_title = ct
+                        track._userplaycount = pc
                         print('  -> matched!', '|', track.artist, '|', track.title, '|')
                         return track
                     except WSError:
@@ -181,8 +203,10 @@ def get_lastfm_playcount(artist, title):
                 LASTFM_PLAYCOUNTS[(artist, title)] = {}
             else:
                 LASTFM_PLAYCOUNTS[(artist, title)] = {
-                    'playcount': track.get_userplaycount() or 0,
+                    'playcount': track._userplaycount,
                     'scrobbled_this_run_count': 0,
+                    'canonical_artist': track._canonical_artist,
+                    'canonical_title': track._canonical_title,
                 }
         except Exception as e:
             print(f"  ⚠️  Error getting Last.fm playcount for {artist} - {title}: {str(e)[:100]}")
@@ -198,26 +222,32 @@ def get_lastfm_playcount(artist, title):
 def scrobble_once(artist, title, dry_run):
     global LASTFM_PLAYCOUNTS
 
+    # Use canonical names from Last.fm so the scrobble targets the same entry
+    # that track.getInfo resolved to (Last.fm auto-corrects getInfo but not scrobble)
+    pc_data = LASTFM_PLAYCOUNTS.get((artist, title), {})
+    scrobble_artist = pc_data.get('canonical_artist', artist)
+    scrobble_title = pc_data.get('canonical_title', title)
+
     # timestamp = int(time.time()) - random.randint(60, 60 * 60 * 2 * 1)  # random timestamp within the last 2 hours
     timestamp = int(time.time()) - random.randint(60, 60 * 60 * 24 * 1)  # random timestamp within last 1 day
     dt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
 
     if dry_run:
-        print(f"  [DRY] scrobble @ {dt}: {artist} – {title} ")
+        print(f"  [DRY] scrobble @ {dt}: {scrobble_artist} – {scrobble_title} ")
     else:
         def _scrobble():
             network.scrobble(
-                artist=artist,
-                title=title,
+                artist=scrobble_artist,
+                title=scrobble_title,
                 timestamp=timestamp,
             )
             time.sleep(config.SCROBBLE_DELAY)
 
         try:
             retry_with_backoff(_scrobble, max_retries=5, initial_delay=2)
-            print(f"  ✓ Scrobbled @ {dt}: {artist} – {title}")
+            print(f"  ✓ Scrobbled @ {dt}: {scrobble_artist} – {scrobble_title}")
         except Exception as e:
-            print(f"  ❌ Failed to scrobble after retries: {artist} – {title}")
+            print(f"  ❌ Failed to scrobble after retries: {scrobble_artist} – {scrobble_title}")
             raise  # Re-raise to let the caller handle it
 
     LASTFM_PLAYCOUNTS[(artist, title)]['scrobbled_this_run_count'] += 1
@@ -274,8 +304,8 @@ def fetch_album_songs(album_id):
             if playcount > 0:
                 tracks.append(
                     {
-                        "artist": normalize_for_lastfm(s.get("artist", "")),
-                        "title": normalize_for_lastfm(s.get("title", "")),
+                        "artist": s.get("artist"),
+                        "title": s.get("title"),
                         "playcount": playcount,
                     }
                 )
