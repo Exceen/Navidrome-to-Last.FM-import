@@ -615,7 +615,8 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
             try:
                 incorrect_scrobbles = user.get_track_scrobbles(artist=artist, track=title)
                 incorrect_count = len(incorrect_scrobbles)
-            except Exception:
+            except Exception as e:
+                print(f"{prefix} | ⚠️  Failed to fetch incorrect scrobbles: {str(e)[:100]}")
                 incorrect_scrobbles = []
                 incorrect_count = 0
 
@@ -635,7 +636,8 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
             try:
                 canonical_scrobbles = user.get_track_scrobbles(artist=canonical_artist, track=canonical_title)
                 timestamps = [int(s.timestamp) for s in canonical_scrobbles[:excess]]
-            except Exception:
+            except Exception as e:
+                print(f"{prefix} | ⚠️  Failed to fetch canonical scrobbles: {str(e)[:100]}")
                 timestamps = []
 
             if len(timestamps) < excess:
