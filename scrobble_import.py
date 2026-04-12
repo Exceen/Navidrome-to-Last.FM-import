@@ -6,6 +6,7 @@ import time
 import random
 import argparse
 import getpass
+import hashlib
 import pylast
 from pylast import WSError
 
@@ -110,12 +111,34 @@ def normalize_cached(s):
 def fuzzy_match(a, b):
     return fuzz.token_sort_ratio(normalize_cached(a), normalize_cached(b))
 
+def _encode_plus(s):
+    """Replace + with %2B to survive Last.fm's broken form decoder.
+
+    Last.fm's API decodes POST bodies in the wrong order: percent-decode
+    first (%2B → +), THEN form-decode (+ → space).  This destroys any
+    literal + in track/artist names.
+
+    By pre-replacing + with %2B in parameter values, httpx form-encodes
+    the % as %25, producing %252B in the wire body.  The server's decoder
+    then does: %252B → %2B (percent-decode) → %2B (no + to replace).
+    The value arrives as the literal string "%2B", which matches how
+    Last.fm already stores these tracks.
+    """
+    return s.replace('+', '%2B')
+
+
 def _call_track_getinfo(track):
     """Call track.getInfo and extract canonical artist, title, and user playcount.
     Returns (canonical_artist, canonical_title, userplaycount).
     Raises WSError if the track doesn't exist on Last.fm."""
     params = track._get_params()
     params["username"] = track.username
+
+    # Work around Last.fm's broken form decoder (see _encode_plus)
+    if '+' in params.get("track", "") or '+' in params.get("artist", ""):
+        params["track"] = _encode_plus(params.get("track", ""))
+        params["artist"] = _encode_plus(params.get("artist", ""))
+
     doc = track._request("track.getInfo", True, params)
 
     playcount = 0
@@ -145,6 +168,7 @@ def _call_track_getinfo(track):
     except IndexError:
         pass
 
+    print(f"  [DEBUG] track.getInfo: artist={repr(canonical_artist)} title={repr(canonical_title)} plays={playcount}")
     return canonical_artist, canonical_title, playcount
 
 def find_track(artist, title, net=None):
@@ -228,12 +252,18 @@ def scrobble_once(artist, title, dry_run):
     scrobble_artist = pc_data.get('canonical_artist', artist)
     scrobble_title = pc_data.get('canonical_title', title)
 
+    # Work around Last.fm's broken form decoder (see _encode_plus)
+    scrobble_artist = _encode_plus(scrobble_artist)
+    scrobble_title = _encode_plus(scrobble_title)
+
     # timestamp = int(time.time()) - random.randint(60, 60 * 60 * 2 * 1)  # random timestamp within the last 2 hours
     timestamp = int(time.time()) - random.randint(60, 60 * 60 * 24 * 1)  # random timestamp within last 1 day
     dt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
 
+    print(f"  [DEBUG] Scrobble artist={repr(scrobble_artist)} title={repr(scrobble_title)}")
+
     if dry_run:
-        print(f"  [DRY] scrobble @ {dt}: {scrobble_artist} – {scrobble_title} ")
+        print(f"  [DRY] scrobble @ {dt}: {scrobble_artist} – {scrobble_title}")
     else:
         def _scrobble():
             network.scrobble(
@@ -371,6 +401,9 @@ def fetch_all_tracks():
     # Use lowercase key for matching, but preserve original casing from the entry with highest playcount
     merged = {}
     for t in tracks:
+        if t['title'].lower().strip() != 'u + ur hand':
+            continue
+
         key = (t["artist"].lower().strip(), t["title"].lower().strip())
         if key not in merged:
             merged[key] = {"artist": t["artist"], "title": t["title"], "playcount": t["playcount"]}
@@ -586,6 +619,35 @@ def get_thread_network():
         )
     return _thread_local.network
 
+def _get_verified_scrobbles(user, artist, track, prefix=""):
+    """Get scrobbles that actually belong to the queried artist/track entry.
+
+    The Last.fm API auto-corrects track names: querying for "U %2B Ur Hand"
+    silently returns scrobbles from "U + Ur Hand" instead. This function
+    filters out scrobbles where the API returned a different entry than
+    what was queried, preventing accidental deletion of correct scrobbles.
+    """
+    scrobbles = user.get_track_scrobbles(artist=artist, track=track)
+
+    verified = []
+    auto_corrected = False
+    for s in scrobbles:
+        returned_artist = str(s.track.artist).lower().strip()
+        returned_title = str(s.track.title).lower().strip()
+        queried_artist = artist.lower().strip()
+        queried_title = track.lower().strip()
+
+        if returned_artist != queried_artist or returned_title != queried_title:
+            if not auto_corrected:
+                print(f"{prefix} | ⚠️  API auto-corrected: queried '{artist} - {track}' → got '{s.track.artist} - {s.track.title}' — skipping these")
+                auto_corrected = True
+            continue
+
+        verified.append(s)
+
+    return verified
+
+
 def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, counter, total, lock):
     with lock:
         counter[0] += 1
@@ -613,7 +675,7 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
         if names_differ:
             print(f"{prefix} | Incorrect name: '{artist} - {title}' → canonical '{canonical_artist} - {canonical_title}'")
             try:
-                incorrect_scrobbles = user.get_track_scrobbles(artist=artist, track=title)
+                incorrect_scrobbles = _get_verified_scrobbles(user, artist, title, prefix)
                 incorrect_count = len(incorrect_scrobbles)
             except Exception as e:
                 print(f"{prefix} | ⚠️  Failed to fetch incorrect scrobbles: {str(e)[:100]}")
@@ -634,7 +696,7 @@ def process_track_for_deletion(artist, title, nd_count, web_session, dry_run, co
             excess = lf_count - nd_count
             print(f"{prefix} | Navidrome={nd_count} Last.fm={lf_count} → {excess} excess on canonical entry")
             try:
-                canonical_scrobbles = user.get_track_scrobbles(artist=canonical_artist, track=canonical_title)
+                canonical_scrobbles = _get_verified_scrobbles(user, canonical_artist, canonical_title, prefix)
                 timestamps = [int(s.timestamp) for s in canonical_scrobbles[:excess]]
             except Exception as e:
                 print(f"{prefix} | ⚠️  Failed to fetch canonical scrobbles: {str(e)[:100]}")
