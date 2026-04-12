@@ -401,8 +401,8 @@ def fetch_all_tracks():
     # Use lowercase key for matching, but preserve original casing from the entry with highest playcount
     merged = {}
     for t in tracks:
-        if t['title'].lower().strip() != 'u + ur hand':
-            continue
+        # if t['title'].lower().strip() != 'u + ur hand':
+        #     continue
 
         key = (t["artist"].lower().strip(), t["title"].lower().strip())
         if key not in merged:
