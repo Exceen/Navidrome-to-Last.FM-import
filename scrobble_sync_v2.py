@@ -588,13 +588,17 @@ def sync_track(nd, lf_by_agg, used_lf_keys, web_session, args, user, counters):
     excess_to_delete = 0
     action = "OK"
 
-    if effective_lf < nd_count:
+    # Target is Navidrome count, but --enforce-cap lowers it to the config cap
+    cap = config.MAX_SCORRBLES_PER_TRACK_TOTAL
+    target = min(nd_count, cap) if args.enforce_cap else nd_count
+
+    if effective_lf < target:
         if counters["max_reached"]:
             action = "skipping (max reached)"
-        elif effective_lf >= config.MAX_SCORRBLES_PER_TRACK_TOTAL:
+        elif effective_lf >= cap:
             action = "skipping (≥ MAX_SCORRBLES_PER_TRACK_TOTAL)"
         else:
-            delta = nd_count - effective_lf
+            delta = target - effective_lf
             delta = min(delta, config.MAX_SCROBBLES_PER_TRACK_PER_RUN)
             if args.max is not None:
                 delta = min(delta, args.max - counters["scrobbled"])
@@ -603,9 +607,9 @@ def sync_track(nd, lf_by_agg, used_lf_keys, web_session, args, user, counters):
                 action = f"+{delta}"
             else:
                 action = "skipping (per-run/max limit)"
-    elif effective_lf > nd_count:
-        excess_to_delete = effective_lf - nd_count
-        if args.delete_excess:
+    elif effective_lf > target:
+        excess_to_delete = effective_lf - target
+        if args.delete_excess or args.enforce_cap:
             action = f"deleting {excess_to_delete} excess"
         else:
             action = f"+{excess_to_delete} excess (use --delete-excess to delete)"
@@ -651,7 +655,7 @@ def sync_track(nd, lf_by_agg, used_lf_keys, web_session, args, user, counters):
                 break
 
     # 9. Execute: delete excess on the canonical entry
-    if excess_to_delete > 0 and args.delete_excess:
+    if excess_to_delete > 0 and (args.delete_excess or args.enforce_cap):
         try:
             scrobbles = _get_verified_scrobbles(user, canonical_artist, canonical_title, prefix)
             timestamps = [int(s.timestamp) for s in scrobbles[:excess_to_delete]]
@@ -695,7 +699,7 @@ def run_orphan_phase(lf_tracks, used_lf_keys, web_session, args, user, counters)
 def main(args):
     start_time = time.time()
 
-    needs_login = args.delete_excess or args.delete_orphans
+    needs_login = args.delete_excess or args.delete_orphans or args.enforce_cap
     web_session = None
     if needs_login:
         password = getpass.getpass("Enter your Last.fm password: ")
@@ -761,5 +765,6 @@ if __name__ == "__main__":
     parser.add_argument("--max", type=int, default=None, help="Stop scrobbling after N scrobbles (does not limit deletes)")
     parser.add_argument("--delete-excess", action="store_true", help="Delete excess scrobbles on canonical Last.fm entries")
     parser.add_argument("--delete-orphans", action="store_true", help="Delete scrobbles for Last.fm tracks that don't exist in Navidrome")
+    parser.add_argument("--enforce-cap", action="store_true", help=f"Also delete down to MAX_SCORRBLES_PER_TRACK_TOTAL ({config.MAX_SCORRBLES_PER_TRACK_TOTAL}) when Last.fm exceeds it")
 
     main(parser.parse_args())
