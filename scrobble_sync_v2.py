@@ -23,6 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import httpx
 import pylast
 import requests
 from pylast import WSError
@@ -64,7 +65,7 @@ def retry_with_backoff(func, max_retries=6, initial_delay=1, backoff_factor=3, *
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
-        except (RequestException, ConnectionError, Timeout, WSError) as e:
+        except (RequestException, ConnectionError, Timeout, WSError, httpx.RequestError) as e:
             last_exception = e
             if attempt < max_retries - 1:
                 print(f"  ⚠️  Network error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
@@ -258,7 +259,11 @@ def _get_verified_scrobbles(user, artist, track, prefix=""):
     Last.fm's API auto-corrects track names silently; this filters out
     results whose returned name doesn't match the one we queried.
     """
-    scrobbles = user.get_track_scrobbles(artist=artist, track=track)
+    scrobbles = retry_with_backoff(
+        lambda: user.get_track_scrobbles(artist=artist, track=track),
+        max_retries=5,
+        initial_delay=2,
+    )
 
     verified = []
     auto_corrected = False
@@ -629,7 +634,11 @@ def sync_track(nd, lf_by_agg, used_lf_keys, web_session, args, user, counters):
     if will_delete_wrong:
         for lf in wrong_lf:
             try:
-                scrobbles = user.get_track_scrobbles(artist=lf["artist"], track=lf["title"])
+                scrobbles = retry_with_backoff(
+                    lambda lf=lf: user.get_track_scrobbles(artist=lf["artist"], track=lf["title"]),
+                    max_retries=5,
+                    initial_delay=2,
+                )
             except Exception as e:
                 print(f"  ⚠️  Failed to fetch wrong-version scrobbles for '{lf['artist']} – {lf['title']}': {str(e)[:100]}")
                 continue
@@ -683,7 +692,11 @@ def run_orphan_phase(lf_tracks, used_lf_keys, web_session, args, user, counters)
         prefix = f"[orphan {i}/{len(orphans)}]"
         print(f"{prefix} {lf['artist']} – {lf['title']} ({lf['playcount']} scrobbles)")
         try:
-            scrobbles = user.get_track_scrobbles(artist=lf["artist"], track=lf["title"])
+            scrobbles = retry_with_backoff(
+                lambda lf=lf: user.get_track_scrobbles(artist=lf["artist"], track=lf["title"]),
+                max_retries=5,
+                initial_delay=2,
+            )
         except Exception as e:
             print(f"  ⚠️  Failed to fetch scrobbles: {str(e)[:100]}")
             continue
